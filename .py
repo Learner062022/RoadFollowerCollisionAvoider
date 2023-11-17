@@ -108,7 +108,7 @@ time.sleep(0.1)
 
 # Move the robot
 def move():
-    camera.observe(init_update, names='value')
+    camera.observe(init_update(), names='value')
     
 # Start moving the robot
 move()

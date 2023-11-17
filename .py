@@ -1,6 +1,9 @@
 import torch
+import time
 import torchvision.transforms as transforms
 import torch.nn.functional as F
+import torchvision
+from IPython.display import display
 import cv2
 import PIL.Image
 import numpy as np
@@ -11,7 +14,7 @@ import ipywidgets.widgets as widgets
 STEERING_GAIN = 0.2
 SPEED = 0.4
 
-# Class for handling model files
+# Handles model files
 class ModelFile:
     def __init__(self, name):
         self._name = name
@@ -26,8 +29,6 @@ class ModelFile:
 
     def load_trained_weights(self, model):
         model.load_state_dict(torch.load(self._name))
-
-device = torch.device('cuda')
 
 # Initialize a ResNet18 model
 def init_resnet18_model():
@@ -48,6 +49,10 @@ def transfer_weights(file: ModelFile):
 follow_road = ModelFile('best_model_resnet18.pth')
 avoid_collision = ModelFile('best_steering_model_xy.pth')
 
+# Load and transfer models' weights
+steering_model_weights_transfered = transfer_weights(follow_road)
+collision_model_weights_transfered = transfer_weights(avoid_collision)
+
 mean = torch.Tensor([0.485, 0.456, 0.406]).cuda().half()
 std = torch.Tensor([0.229, 0.224, 0.225]).cuda().half()
 
@@ -58,64 +63,52 @@ def preprocess(image):
     image.sub_(mean[:, None, None]).div_(std[:, None, None])
     return image[None, ...]
 
-# Display the camera image
-def display_camera():
-    camera = Camera.instance(width=224, height=224, fps=10)
-    image_widget = ipywidgets.Image()
-    traitlets.dlink((camera, 'value'), (image_widget, 'value'), transform=bgr8_to_jpeg)
-    display(image_widget)
+# Initialiase the camera
+camera = Camera.instance(width=224, height=224, fps=10)
+image_widget = widgets.Image()
+traitlets.dlink((camera, 'value'), (image_widget, 'value'), transform=bgr8_to_jpeg)
+display(image_widget)
 
 robot = Robot()
 
 # Compute steering value
 def compute_steering_val(model, x):
-    model = preprocess(x)
-    xy = model(model)
-    y = (0.5 - xy[1]) / 2.0
-    return np.arctan2(xy[0], y)
+    xy = model(x).detach().float().cpu().numpy().flatten()
+    return np.arctan2(xy[0], (0.5 - xy[1]) / 2.0)
 
 # Calculate PID
 def calc_pid(angle, angle_last):
     return angle * STEERING_GAIN + (angle - angle_last) * STEERING_GAIN
 
 # Control motors
-def control_motors(model, angle, angle_last):
-    pid = calc_pid(compute_steering_val(model), angle_last)
+def control_motors(model, angle_last):
+    x = camera.value
+    x = preprocess(x)
+    
+    # Collision avoidance model
+    prob_blocked = float(F.softmax(collision_model_weights_transfered(x), dim=1).flatten()[0])
+    if prob_blocked > 0.5:
+        robot.stop()
+    
+    # Road following model
+    steering_val = compute_steering_val(model, x)
+    pid = calc_pid(steering_val, angle_last)
     robot.left_motor.value = max(min(SPEED + pid, 1.0), 0.0)
     robot.right_motor.value = max(min(SPEED - pid, 1.0), 0.0)
 
-# Normalize output vector
-def normalize_output_vector(value):
-    return F.softmax(value, dim=1)
-
-# Check if blocked
-def check_blocked(value):
-    prob_blocked = float(value.flatten()[0])
-    if prob_blocked < 0.5:
-        return False
-    else:
-        return True
-
-# Move forward
-def move_forwards(value, inst_robot):
-    if value:
-        inst_robot.forward(speed)
-    else:
-        inst_robot.stop()
-
 # Update based on camera change
-def update(change, model, robot_inst, angle_last):
-    x = change['new']
-    x = preprocess(x)
-    y = normalize_output_vector(model(x))
-    blocked = checked_blocked(y)
-    move_forwards(blocked, robot_inst)
-    control_motors(model, compute_steering_val(model, x), angle_last)
+def update(change):
+    control_motors(steering_model_weights_transfered, 0.0)
 
 # Initialize update
 def init_update():
-    update({'new': camera.value}, steering_model_weights_transfered, robot, 0.0)
+    update({'new': camera.value})
+    
+time.sleep(0.1)
 
 # Move the robot
 def move():
-    camera.observe(init_update(), names='value')
+    camera.observe(init_update, names='value')
+    
+# Start moving the robot
+move()
